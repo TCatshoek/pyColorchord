@@ -2,6 +2,7 @@ import pyaudio
 import time
 import numpy as np
 import pygame
+import math
 
 # Setup pygame
 pygame.init()
@@ -38,16 +39,52 @@ def do_dfts(freqs, signal, samplerate):
 
     return np.mean(points, axis=1)
 
+# HSV to RGB conversion, http://code.activestate.com/recipes/576919-python-rgb-and-hsv-conversion/
+def hsv2rgb(h, s, v):
+    h = float(h)
+    s = float(s)
+    v = float(v)
+    h60 = h / 60.0
+    h60f = math.floor(h60)
+    hi = int(h60f) % 6
+    f = h60 - h60f
+    p = v * (1 - s)
+    q = v * (1 - f * s)
+    t = v * (1 - (1 - f) * s)
+    r, g, b = 0, 0, 0
+    if hi == 0: r, g, b = v, t, p
+    elif hi == 1: r, g, b = q, v, p
+    elif hi == 2: r, g, b = p, v, t
+    elif hi == 3: r, g, b = p, q, v
+    elif hi == 4: r, g, b = t, p, v
+    elif hi == 5: r, g, b = v, p, q
+    r, g, b = int(r * 255), int(g * 255), int(b * 255)
+    return r, g, b
+
+
+colormem = {}
+def bin2color(bin, bins_p_octave):
+    if (bin, bins_p_octave) in colormem.keys():
+        return colormem[(bin, bins_p_octave)]
+    else:
+        color = hsv2rgb(((bin % bins_p_octave) / bins_p_octave) * 360, 1, 1)
+        colormem[(bin, bins_p_octave)] = color
+        return color
+
+
 # Get frequency from piano key number https://en.wikipedia.org/wiki/Piano_key_frequencies
 def getfreq(key_n):
     return 2**((key_n - 49) / 12) * 440
 
 #TODO:
-def foldfft(freqs):
-    tmp = np.zeros(12)
-    for i in range(len(freqs) // 24):
-        tmp[:] += np.mean(np.reshape(freqs[(i*24) : (i*24) + 24], (12,2)), axis=1)
-    return tmp - 0.5 * np.mean(tmp)
+def foldfft(freqs, n_bins, n_per_octave):
+    assert len(freqs) % n_bins == 0, f'n freqs {len(freqs)}, not divisable by {n_bins}'
+
+    tmp = np.zeros(n_bins)
+
+    for i in range(len(freqs) // n_per_octave):
+        tmp[:] += freqs[i * n_per_octave: i * n_per_octave + n_per_octave]
+    return tmp - 0.9 * np.min(tmp)
 
 
 # Open pyaudio input stream
@@ -59,6 +96,18 @@ stream = p.open(format=pyaudio.paFloat32,
 # start the stream
 stream.start_stream()
 
+# Piano key numbers
+octaves = 9
+pianokeys = np.arange(25, (octaves * 12) + 1, 0.5)
+
+# Gather frequencies to DFT at
+freqs = np.array([getfreq(key_n) for key_n in pianokeys])
+
+# Memory to keep rolling average
+n_keep = 5
+avg_mem_idx = 0
+avg_mem = np.zeros((n_keep, len(freqs)))
+
 # MAIN LOOP
 should_quit = False
 while stream.is_active() and not should_quit:
@@ -66,8 +115,10 @@ while stream.is_active() and not should_quit:
         if event.type == pygame.QUIT:
             should_quit = True
 
+    start_time = time.time()
+
     # Read samples
-    n_samples = 1024
+    n_samples = 512
 
     samples = stream.read(n_samples)
     samples = np.frombuffer(samples, dtype=np.float32)
@@ -75,22 +126,44 @@ while stream.is_active() and not should_quit:
     # Apply windowing function
     samples = np.bartlett(len(samples)) * samples
 
-    # Gather frequencies to DFT at
-    freqs = np.array([getfreq(key_n) for key_n in np.arange(0, 108, 0.5)])
-
     # Perform DFT
     # We cannot do FFT because we need the frequency bins to be chromatic
     dftime = time.time()
     dfts = np.abs(do_dfts(freqs, samples, 44100))
     print(f'DFT took {time.time() - dftime} s, { 1/ (time.time() - dftime)} Hz')
 
+    # Taper first octave
+    taper = np.ones(dfts.size)
+    taper[0:24] = np.linspace(0, 1, 24)
+    dfts = dfts * taper
+
+    # Add dft result to rolling average
+    avg_mem[avg_mem_idx, :] = dfts
+    avg_mem_idx = (avg_mem_idx + 1) % n_keep
+    avged_dfts = np.mean(avg_mem, axis=0)
+
+    # Fold dft output
+    notes = foldfft(avged_dfts, 24, 24)
+
     # Draw visualization
     screen.fill((0, 0, 0))
 
-    per_note = window_w // len(dfts)
-    for i, note in enumerate(dfts):
-        pygame.draw.rect(screen, (255, 255, 255), pygame.Rect(i * per_note + 1, window_h, per_note - 1, note * -2000))
+    # Draw folded dft
+    per_note = window_w // len(notes)
+    for i, note in enumerate(notes):
+        #color = (255, 0, 0) if np.argmax(notes) == i else (255, 255, 255)
+        color = bin2color(i, 24)
+        pygame.draw.rect(screen, color, pygame.Rect(i * per_note + 1, 0, per_note - 1, note * 2000))
 
+    # Draw complete dft
+    per_note = window_w // len(avged_dfts)
+    for i, note in enumerate(avged_dfts):
+        color = bin2color(i, 24)
+        pygame.draw.rect(screen, color, pygame.Rect(i * per_note + 1, window_h, per_note - 1, note * -2000))
+
+    end_time = time.time()
+
+    print('Total time', end_time - start_time,  1 / (end_time - start_time), 'Fps')
 
     pygame.display.flip()
 
