@@ -3,6 +3,7 @@ import time
 import numpy as np
 import pygame
 import math
+from scipy.ndimage import gaussian_filter1d
 
 # Setup pygame
 pygame.init()
@@ -98,15 +99,18 @@ stream.start_stream()
 
 # Piano key numbers
 octaves = 9
+#pianokeys = np.arange(25, (octaves * 12) + 1, 0.5)
 pianokeys = np.arange(25, (octaves * 12) + 1, 0.5)
-
 # Gather frequencies to DFT at
 freqs = np.array([getfreq(key_n) for key_n in pianokeys])
 
 # Memory to keep rolling average
-n_keep = 5
+n_keep = 3
 avg_mem_idx = 0
 avg_mem = np.zeros((n_keep, len(freqs)))
+
+# Keep notes
+actual_notes = np.zeros(12)
 
 # MAIN LOOP
 should_quit = False
@@ -134,7 +138,8 @@ while stream.is_active() and not should_quit:
 
     # Taper first octave
     taper = np.ones(dfts.size)
-    taper[0:24] = np.linspace(0, 1, 24)
+    taper[0:48] = np.linspace(0, 1, 48)
+    #taper[0:48] = 1 - np.flip(np.geomspace(0.0001, 1, 48))
     dfts = dfts * taper
 
     # Add dft result to rolling average
@@ -144,6 +149,33 @@ while stream.is_active() and not should_quit:
 
     # Fold dft output
     notes = foldfft(avged_dfts, 24, 24)
+
+    # Filter notes
+    sigma = 1
+    filtered_notes = gaussian_filter1d(notes, sigma, mode='wrap')
+
+    # Find peaks
+    peaks = []
+    for idx, (prev, cur, next) in enumerate([filtered_notes[x : x + 3] for x in range(len(filtered_notes) - 4)]):
+        if prev < cur and cur > next:
+            peaks.append((idx, cur))
+
+    # Only keep n larges peaks
+    n_keep_peaks = 5
+    peaks = sorted(peaks, key=lambda x: x[1], reverse=True)[0:n_keep_peaks]
+
+    # Put peaks in note bins
+    for (idx, amplitude) in peaks:
+        if idx in range(0, 24, 2):
+           actual_notes[idx // 2] += amplitude
+        else:
+            prev = math.floor(idx / 2)
+            next = math.ceil(idx / 2)
+            actual_notes[prev] += 0.5 * amplitude
+            actual_notes[next] += 0.5 * amplitude
+
+    # Decay note bins
+    actual_notes *= 0.8
 
     # Draw visualization
     screen.fill((0, 0, 0))
@@ -155,11 +187,30 @@ while stream.is_active() and not should_quit:
         color = bin2color(i, 24)
         pygame.draw.rect(screen, color, pygame.Rect(i * per_note + 1, 0, per_note - 1, note * 2000))
 
+    # Draw filtered note distribution
+    amp = 4000
+    per_note = window_w // len(filtered_notes)
+    # Calc line points
+    coords = [(per_note * i + 0.5 * per_note, note * amp) for i, note in enumerate(filtered_notes)]
+    # Loop around edges
+    coords = [(-1.5 * per_note, filtered_notes[23] * amp)] + coords + [((len(filtered_notes) + 1.5) * per_note, filtered_notes[0] * amp)]
+    pygame.draw.lines(screen, (255, 255, 255), False, coords)
+
+    # Draw peak points
+    for (idx, amplitude) in peaks:
+        pygame.draw.circle(screen, bin2color(idx + 1, 24), (int(per_note * idx + 1.5 * per_note), int(amplitude * amp)), int(amplitude * 1000))
+
     # Draw complete dft
     per_note = window_w // len(avged_dfts)
     for i, note in enumerate(avged_dfts):
         color = bin2color(i, 24)
         pygame.draw.rect(screen, color, pygame.Rect(i * per_note + 1, window_h, per_note - 1, note * -2000))
+
+    # Draw actual notes
+    per_note = window_w // len(actual_notes)
+    for i, note in enumerate(actual_notes):
+        color = bin2color(i, 12)
+        pygame.draw.rect(screen, color, pygame.Rect(i * per_note + 1, window_h - 100, per_note - 1, note * -2000))
 
     end_time = time.time()
 
