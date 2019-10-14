@@ -98,14 +98,15 @@ stream = p.open(format=pyaudio.paFloat32,
 stream.start_stream()
 
 # Piano key numbers
-octaves = 9
+n_skipped = 2
+octaves = 6
 #pianokeys = np.arange(25, (octaves * 12) + 1, 0.5)
-pianokeys = np.arange(25, (octaves * 12) + 1, 0.5)
+pianokeys = np.arange((12 * n_skipped) + 1, (12 * n_skipped) + 1 + (octaves * 12), 0.5)
 # Gather frequencies to DFT at
 freqs = np.array([getfreq(key_n) for key_n in pianokeys])
 
 # Memory to keep rolling average
-n_keep = 3
+n_keep = 5
 avg_mem_idx = 0
 avg_mem = np.zeros((n_keep, len(freqs)))
 
@@ -122,13 +123,13 @@ while stream.is_active() and not should_quit:
     start_time = time.time()
 
     # Read samples
-    n_samples = 512
+    n_samples = 1024
 
     samples = stream.read(n_samples)
     samples = np.frombuffer(samples, dtype=np.float32)
 
     # Apply windowing function
-    samples = np.bartlett(len(samples)) * samples
+    samples = np.blackman(len(samples)) * samples
 
     # Perform DFT
     # We cannot do FFT because we need the frequency bins to be chromatic
@@ -136,9 +137,9 @@ while stream.is_active() and not should_quit:
     dfts = np.abs(do_dfts(freqs, samples, 44100))
     print(f'DFT took {time.time() - dftime} s, { 1/ (time.time() - dftime)} Hz')
 
-    # Taper first octave
+    #Taper first octave
     taper = np.ones(dfts.size)
-    taper[0:48] = np.linspace(0, 1, 48)
+    taper[0:24] = np.linspace(0, 1, 24)
     #taper[0:48] = 1 - np.flip(np.geomspace(0.0001, 1, 48))
     dfts = dfts * taper
 
@@ -156,7 +157,13 @@ while stream.is_active() and not should_quit:
 
     # Find peaks
     peaks = []
-    for idx, (prev, cur, next) in enumerate([filtered_notes[x : x + 3] for x in range(len(filtered_notes) - 4)]):
+    # Need wraparounds too
+    # TODO: BROKEN
+    wrapback = [np.array([filtered_notes[-1], filtered_notes[0], filtered_notes[1]])]
+    wrapfront = [np.array([filtered_notes[-2], filtered_notes[-1], filtered_notes[0]])]
+    triplets = [filtered_notes[x: x + 3] for x in range(len(filtered_notes) - 2)]
+    triplets = wrapback + triplets + wrapfront
+    for idx, (prev, cur, next) in enumerate(triplets):
         if prev < cur and cur > next:
             peaks.append((idx, cur))
 
@@ -172,7 +179,7 @@ while stream.is_active() and not should_quit:
             prev = math.floor(idx / 2)
             next = math.ceil(idx / 2)
             actual_notes[prev] += 0.5 * amplitude
-            actual_notes[next] += 0.5 * amplitude
+            actual_notes[next % 12] += 0.5 * amplitude
 
     # Decay note bins
     actual_notes *= 0.8
@@ -183,8 +190,8 @@ while stream.is_active() and not should_quit:
     # Draw folded dft
     per_note = window_w // len(notes)
     for i, note in enumerate(notes):
-        #color = (255, 0, 0) if np.argmax(notes) == i else (255, 255, 255)
-        color = bin2color(i, 24)
+        color = (255, 255, 255) if np.argmax(notes) == i else bin2color(i, 24)
+        #color = bin2color(i, 24)
         pygame.draw.rect(screen, color, pygame.Rect(i * per_note + 1, 0, per_note - 1, note * 2000))
 
     # Draw filtered note distribution
@@ -198,7 +205,7 @@ while stream.is_active() and not should_quit:
 
     # Draw peak points
     for (idx, amplitude) in peaks:
-        pygame.draw.circle(screen, bin2color(idx + 1, 24), (int(per_note * idx + 1.5 * per_note), int(amplitude * amp)), int(amplitude * 1000))
+        pygame.draw.circle(screen, bin2color(idx, 24), (int(per_note * idx + .5 * per_note), int(amplitude * amp)), int(amplitude * 1000))
 
     # Draw complete dft
     per_note = window_w // len(avged_dfts)
