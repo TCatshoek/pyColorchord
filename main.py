@@ -4,6 +4,15 @@ import numpy as np
 import pygame
 import math
 from scipy.ndimage import gaussian_filter1d
+from scipy.special import softmax
+
+from dfts import do_dfts
+from util import *
+
+samplerate = 44100
+n_samples = 1024
+
+bin_width = samplerate / n_samples
 
 # Setup pygame
 pygame.init()
@@ -14,96 +23,56 @@ screen = pygame.display.set_mode((window_w, window_h))
 # instantiate PyAudio (1)
 p = pyaudio.PyAudio()
 
-
-pi2 = np.pi * 2
-# e^jx = sin(x) + j*cos(x)
-# Numpy dft for a single frequency
-def do_dft(freq, signal, samplerate):
-    freq_step = (len(signal) * freq) / samplerate
-
-    frac_dists = np.array(range(len(signal))) / len(signal)
-    points = signal * np.exp(-1j*pi2*(freq_step)*frac_dists)
-
-    return np.mean(points)
-
-# Fast-ish vectorized dft for multiple given frequencies
-def do_dfts(freqs, signal, samplerate):
-    freqs = np.array(freqs)
-
-    freq_steps = (len(signal) * freqs) / samplerate
-
-    frac_dists = np.array(range(len(signal))) / len(signal)
-
-    frac_steps = np.reshape(freq_steps, (-1, 1)).dot(np.reshape(frac_dists, (-1, 1)).T)
-
-    points = signal * np.exp(-1j*pi2*frac_steps)
-
-    return np.mean(points, axis=1)
-
-# HSV to RGB conversion, http://code.activestate.com/recipes/576919-python-rgb-and-hsv-conversion/
-def hsv2rgb(h, s, v):
-    h = float(h)
-    s = float(s)
-    v = float(v)
-    h60 = h / 60.0
-    h60f = math.floor(h60)
-    hi = int(h60f) % 6
-    f = h60 - h60f
-    p = v * (1 - s)
-    q = v * (1 - f * s)
-    t = v * (1 - (1 - f) * s)
-    r, g, b = 0, 0, 0
-    if hi == 0: r, g, b = v, t, p
-    elif hi == 1: r, g, b = q, v, p
-    elif hi == 2: r, g, b = p, v, t
-    elif hi == 3: r, g, b = p, q, v
-    elif hi == 4: r, g, b = t, p, v
-    elif hi == 5: r, g, b = v, p, q
-    r, g, b = int(r * 255), int(g * 255), int(b * 255)
-    return r, g, b
-
-
-colormem = {}
-def bin2color(bin, bins_p_octave):
-    if (bin, bins_p_octave) in colormem.keys():
-        return colormem[(bin, bins_p_octave)]
-    else:
-        color = hsv2rgb(((bin % bins_p_octave) / bins_p_octave) * 360, 1, 1)
-        colormem[(bin, bins_p_octave)] = color
-        return color
-
-
-# Get frequency from piano key number https://en.wikipedia.org/wiki/Piano_key_frequencies
-def getfreq(key_n):
-    return 2**((key_n - 49) / 12) * 440
-
-#TODO:
-def foldfft(freqs, n_bins, n_per_octave):
-    assert len(freqs) % n_bins == 0, f'n freqs {len(freqs)}, not divisable by {n_bins}'
-
-    tmp = np.zeros(n_bins)
-
-    for i in range(len(freqs) // n_per_octave):
-        tmp[:] += freqs[i * n_per_octave: i * n_per_octave + n_per_octave]
-    return tmp - 0.9 * np.min(tmp)
-
-
 # Open pyaudio input stream
 stream = p.open(format=pyaudio.paFloat32,
                 channels=1,
-                rate=44100,
+                rate=samplerate,
                 input=True)
 
 # start the stream
 stream.start_stream()
 
 # Piano key numbers
-n_skipped = 2
+n_skipped = 1
 octaves = 6
 #pianokeys = np.arange(25, (octaves * 12) + 1, 0.5)
 pianokeys = np.arange((12 * n_skipped) + 1, (12 * n_skipped) + 1 + (octaves * 12), 0.5)
 # Gather frequencies to DFT at
 freqs = np.array([getfreq(key_n) for key_n in pianokeys])
+
+# ---- create scaling based on how often frequency bins overlap -----
+# Need previous two octaves to get bins correct
+prev_pianokeys = np.arange((12 * n_skipped) + 1 - 24, (12 * n_skipped) + 1, 0.5)
+prev_freqs = np.array([getfreq(key_n) for key_n in prev_pianokeys])
+allfreqs = np.concatenate((prev_freqs, freqs))
+
+# Create scaling based on bin width
+bins = []
+for freq in allfreqs:
+    halfbinw = bin_width / 2
+    lower = freq - halfbinw
+    upper = freq + halfbinw
+    bins.append((lower, upper))
+
+# Count the amount of bins a certain frequency is in
+scale_count = np.zeros(len(freqs))
+for idx, freq in enumerate(freqs):
+    for (l, h) in bins:
+        if freq > l and freq <= h:
+            # How far from the sides are we?
+            ldist = freq - l
+            rdist = h - freq
+
+            #normalize
+            ldist_n = ldist / (ldist + rdist)
+            rdist_n = rdist / (ldist + rdist)
+
+            dist = min(ldist_n, rdist_n) * 2
+
+            scale_count[idx] += dist
+
+scaler = 1 - (scale_count / np.max(scale_count))
+
 
 # Memory to keep rolling average
 n_keep = 5
@@ -111,7 +80,9 @@ avg_mem_idx = 0
 avg_mem = np.zeros((n_keep, len(freqs)))
 
 # Keep notes
-actual_notes = np.zeros(12)
+n_keep_notes = 1
+actual_notes_idx = 0
+actual_notes_mem = np.zeros((n_keep_notes, 12))
 
 # MAIN LOOP
 should_quit = False
@@ -123,8 +94,6 @@ while stream.is_active() and not should_quit:
     start_time = time.time()
 
     # Read samples
-    n_samples = 1024
-
     samples = stream.read(n_samples)
     samples = np.frombuffer(samples, dtype=np.float32)
 
@@ -134,14 +103,15 @@ while stream.is_active() and not should_quit:
     # Perform DFT
     # We cannot do FFT because we need the frequency bins to be chromatic
     dftime = time.time()
-    dfts = np.abs(do_dfts(freqs, samples, 44100))
+    dfts = np.abs(do_dfts(freqs, samples, samplerate))
     print(f'DFT took {time.time() - dftime} s, { 1/ (time.time() - dftime)} Hz')
 
     #Taper first octave
     taper = np.ones(dfts.size)
     taper[0:24] = np.linspace(0, 1, 24)
     #taper[0:48] = 1 - np.flip(np.geomspace(0.0001, 1, 48))
-    dfts = dfts * taper
+    dfts = dfts * scaler
+    #dfts = dfts * taper
 
     # Add dft result to rolling average
     avg_mem[avg_mem_idx, :] = dfts
@@ -157,8 +127,8 @@ while stream.is_active() and not should_quit:
 
     # Find peaks
     peaks = []
-    # Need wraparounds too
-    # TODO: BROKEN
+
+    # Include wraparound for first and last bin
     wrapback = [np.array([filtered_notes[-1], filtered_notes[0], filtered_notes[1]])]
     wrapfront = [np.array([filtered_notes[-2], filtered_notes[-1], filtered_notes[0]])]
     triplets = [filtered_notes[x: x + 3] for x in range(len(filtered_notes) - 2)]
@@ -167,24 +137,30 @@ while stream.is_active() and not should_quit:
         if prev < cur and cur > next:
             peaks.append((idx, cur))
 
-    # Only keep n larges peaks
+    # Only keep n largest peaks
     n_keep_peaks = 5
     peaks = sorted(peaks, key=lambda x: x[1], reverse=True)[0:n_keep_peaks]
 
     # Put peaks in note bins
     for (idx, amplitude) in peaks:
         if idx in range(0, 24, 2):
-           actual_notes[idx // 2] += amplitude
+            actual_notes_mem[actual_notes_idx, idx // 2] = amplitude
         else:
             prev = math.floor(idx / 2)
             next = math.ceil(idx / 2)
-            actual_notes[prev] += 0.5 * amplitude
-            actual_notes[next % 12] += 0.5 * amplitude
+            actual_notes_mem[actual_notes_idx, prev] = 0.5 * amplitude
+            actual_notes_mem[actual_notes_idx, next % 12] = 0.5 * amplitude
 
     # Decay note bins
-    actual_notes *= 0.8
+    actual_notes_mem[actual_notes_idx, :] *= 0.8
 
-    # Draw visualization
+    # # Try softmax to see if it helps isolate notes better?
+    # actual_notes_mem[actual_notes_idx, :] = softmax(actual_notes_mem[actual_notes_idx])
+    # actual_notes_mem[actual_notes_idx, :] -= np.min(actual_notes_mem[actual_notes_idx])
+    actual_notes_idx = (actual_notes_idx + 1) % n_keep_notes
+    actual_notes = np.mean(actual_notes_mem, axis=0) * 0.1
+
+    # --------------Draw visualization-----------------
     screen.fill((0, 0, 0))
 
     # Draw folded dft
@@ -217,15 +193,13 @@ while stream.is_active() and not should_quit:
     per_note = window_w // len(actual_notes)
     for i, note in enumerate(actual_notes):
         color = bin2color(i, 12)
-        pygame.draw.rect(screen, color, pygame.Rect(i * per_note + 1, window_h - 100, per_note - 1, note * -2000))
+        pygame.draw.rect(screen, color, pygame.Rect(i * per_note + 1, window_h - 100, per_note - 1, note * -100000))
 
     end_time = time.time()
 
     print('Total time', end_time - start_time,  1 / (end_time - start_time), 'Fps')
 
     pygame.display.flip()
-
-
 
 
 # Cleanup
